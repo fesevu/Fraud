@@ -1,1 +1,5 @@
 .venv
+kaggle.json
+data
+artifacts
+checkpoints
