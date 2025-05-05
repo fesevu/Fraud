@@ -105,16 +105,19 @@ print(df.columns.tolist())
 
 # %%
 # %% [data scrubbing]
-# Check for missing values and drop if any
-missing_counts = df.isnull().sum()
-print("Missing values per column:\n", missing_counts)
-if missing_counts.any():
-    df = df.dropna()
-    print("Dropped rows with missing values. New shape:", df.shape)
-else:
-    print("No missing values found.")
+# Список столбцов, в которых НЕ хотим допускать NaN
+cols_required = [col for col in df.columns 
+                 if col not in ['from_category', 'to_category']]
 
-# Check for duplicate rows and drop if any
+# Считаем пропуски по этим столбцам
+missing_counts_req = df[cols_required].isnull().sum()
+print("Missing values in required columns:\n", missing_counts_req)
+
+# Дропаем строки, где есть хоть одно NaN в обязательных столбцах
+df = df.dropna(subset=cols_required)
+print("After dropping rows with missing in required cols:", df.shape)
+
+# Проверка и дроп дубликатов
 dup_count = df.duplicated().sum()
 print("Duplicate rows count:", dup_count)
 if dup_count > 0:
@@ -122,229 +125,136 @@ if dup_count > 0:
     print("Dropped duplicate rows. New shape:", df.shape)
 else:
     print("No duplicate rows found.")
-# %% [feature engineering]
-# Reload dataframe if block_timestamp column was dropped in a previous run
-if 'block_timestamp' not in df.columns:
-    df = pd.read_csv(dataset_csv_path)
-# Extract year directly from block_timestamp string
-df['block_year'] = df['block_timestamp'].str[:4].astype(int)
 
-# Categorize transaction values into 3 quantile-based categories
+# %%
+# Считаем количество 0 и 1 в from_scam / to_scam
+from_counts = df['from_scam'].value_counts().rename({0: 'non_scam', 1: 'scam'})
+to_counts   = df['to_scam'  ].value_counts().rename({0: 'non_scam', 1: 'scam'})
+
+print("Sender (from_scam):")
+print(from_counts)
+print("\nRecipient (to_scam):")
+print(to_counts)
+
+# Если вас интересуют транзакции, где есть хоть одна пометка scam:
+df['any_scam'] = ((df['from_scam'] == 1) | (df['to_scam'] == 1)).astype(int)
+any_counts = df['any_scam'].value_counts().rename({0: 'no_scam', 1: 'has_scam'})
+print("\nTransactions with any scam flag:")
+print(any_counts)
+
+# %%
+import pandas as pd
+
+# # Допустим, df уже загружен и очищен от NaN/дубликатов
+
+# # 1) Балансировка по from_scam
+# n_from_scam = df['from_scam'].sum()  # должно быть 2617
+# df_from_pos = df[df['from_scam'] == 1]
+# df_from_neg = df[df['from_scam'] == 0].sample(n=n_from_scam, random_state=42)
+# df_balanced_from = pd.concat([df_from_pos, df_from_neg]) \
+#                      .sample(frac=1, random_state=42) \
+#                      .reset_index(drop=True)
+
+# print("Balanced from_scam:")
+# print(df_balanced_from['from_scam'].value_counts())
+
+# # 2) Балансировка по to_scam
+# n_to_scam = df['to_scam'].sum()  # 11638
+# df_to_pos = df[df['to_scam'] == 1]
+# df_to_neg = df[df['to_scam'] == 0].sample(n=n_to_scam, random_state=42)
+# df_balanced_to = pd.concat([df_to_pos, df_to_neg]) \
+#                    .sample(frac=1, random_state=42) \
+#                    .reset_index(drop=True)
+
+# print("\nBalanced to_scam:")
+# print(df_balanced_to['to_scam'].value_counts())
+
+# Если нужно ровно 2617 для обоих (независимо от фактического числа):
+desired_n = 2617
+
+# По from_scam
+df_from_pos = df[df['from_scam'] == 1]
+df_from_neg = df[df['from_scam'] == 0].sample(n=desired_n, random_state=42)
+df_sampled_from_exact = pd.concat([df_from_pos, df_from_neg]) \
+                           .sample(frac=1, random_state=42) \
+                           .reset_index(drop=True)
+
+# По to_scam
+df_to_pos = df[df['to_scam'] == 1].sample(n=desired_n, random_state=42)
+df_to_neg = df[df['to_scam'] == 0].sample(n=desired_n, random_state=42)
+df_sampled_to_exact = pd.concat([df_to_pos, df_to_neg]) \
+                         .sample(frac=1, random_state=42) \
+                         .reset_index(drop=True)
+
+print("\nExact 2617 each for from_scam:")
+print(df_sampled_from_exact['from_scam'].value_counts())
+print("\nExact 2617 each for to_scam:")
+print(df_sampled_to_exact['to_scam'].value_counts())
+
+# %%
+
+df['block_year'] = (
+    df['block_timestamp']
+      .str.extract(r'^(\d{4})')[0]
+      .astype(int)
+)
+
+# 2. Квантильное разбиение стоимости
 df['value_cat'] = pd.qcut(df['value'], q=3, labels=False)
 
-# Compute registration year (first seen block year) per node address
-from_reg = df.groupby('from_address')['block_year'].min().rename('from_reg_year')
-to_reg   = df.groupby('to_address')['block_year'].min().rename('to_reg_year')
-df = df.merge(from_reg, on='from_address', how='left').merge(to_reg, on='to_address', how='left')
+# 3. Адрес‑уровень: год регистрации и максимальное значение
+addr_years = pd.concat([
+        df[['from_address','block_year']].rename(columns={'from_address':'address'}),
+        df[['to_address','block_year']].rename(columns={'to_address':'address'})
+])
+addr_reg_year  = addr_years.groupby('address')['block_year'].min().rename('reg_year')
 
-# Compute years in operation based on the latest block year in the dataset
+addr_vals = pd.concat([
+        df[['from_address','value']].rename(columns={'from_address':'address'}),
+        df[['to_address','value']].rename(columns={'to_address':'address'})
+])
+addr_max_value = addr_vals.groupby('address')['value'].max().rename('max_value')
+
+address_features = (
+    pd.concat([addr_reg_year, addr_max_value], axis=1)
+      .reset_index()                     # колонка index → address
+      .rename(columns={'index':'address'})
+)
+
 current_year = df['block_year'].max()
-df['from_years_in_operation'] = current_year - df['from_reg_year']
-df['to_years_in_operation']   = current_year - df['to_reg_year']
+address_features['years_in_operation'] = (
+        current_year - address_features['reg_year']
+)
 
-# Compute max transaction value per node address
-from_max = df.groupby('from_address')['value'].max().rename('from_max_value')
-to_max   = df.groupby('to_address')['value'].max().rename('to_max_value')
-df = df.merge(from_max, on='from_address', how='left').merge(to_max, on='to_address', how='left')
+# 4. Присоединяем к транзакциям
+df = (df
+      .merge(address_features.add_prefix('from_'),
+             left_on='from_address', right_on='from_address', how='left')
+      .merge(address_features.add_prefix('to_'),
+             left_on='to_address',   right_on='to_address',   how='left')
+)
 
-# Drop unneeded columns
-cols_to_drop = [
-    'hash', 'nonce', 'transaction_index', 'input',
-    'block_timestamp', 'block_hash',
-    'from_category', 'to_category', 'value'
+edge_features = [
+    'gas','gas_price','receipt_cumulative_gas_used','receipt_gas_used',
+    'block_number','value_cat',
+    'from_years_in_operation','to_years_in_operation'
 ]
-df = df.drop(columns=cols_to_drop)
-
-# Define feature sets
-edge_features   = [
-    'gas', 'gas_price', 'receipt_cumulative_gas_used', 'receipt_gas_used',
-    'block_number', 'value_cat', 'from_years_in_operation', 'to_years_in_operation'
+node_features = [
+    'from_reg_year','to_reg_year',
+    'from_max_value','to_max_value'
 ]
-node_features   = ['from_reg_year', 'to_reg_year', 'from_max_value', 'to_max_value']
-response_cols   = ['from_scam', 'to_scam']
+response_cols = ['from_scam','to_scam']
 
-print("Dataframe after feature engineering:", df.shape)
-print("Edge features:", edge_features)
-print("Node features:", node_features)
-print("Response columns:", response_cols)
+print(df.shape)
+print("Edge :", edge_features)
+print("Node :", node_features)
 
+# %%
 # %% [data preview]
 # Show sample records from beginning, middle, and end for clarity
 sample_idxs = [0, df.shape[0] // 2, df.shape[0] - 1]
 preview_df = df.loc[sample_idxs, edge_features + node_features + response_cols]
 print("\nPreview of selected features at various positions:\n")
 print(preview_df.to_string(index=True))
-
-# %% [markdown]
-# # Определяем модель
-
-# %%
-# %% [define model]
-class GCN(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dims, output_dim):
-        super(GCN, self).__init__()
-        dims = [input_dim] + hidden_dims + [output_dim]
-        self.convs = torch.nn.ModuleList()
-        for i in range(len(dims) - 1):
-            self.convs.append(GCNConv(dims[i], dims[i+1]))
-        self.activation = torch.nn.ReLU()
-
-    def forward(self, x, edge_index):
-        for conv in self.convs[:-1]:
-            x = conv(x, edge_index)
-            x = self.activation(x)
-        x = self.convs[-1](x, edge_index)
-        return x
-
-# Instantiate model
-input_dim = len(node_features)
-hidden_dims = [32, 16, 16, 16, 4]
-output_dim = len(response_cols)
-model = GCN(input_dim, hidden_dims, output_dim)
-
-# Debug information
-print("Model architecture:\\n", model)
-total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Total trainable parameters: {total_params}")
-
-# %%
-# %% [set optimizer]
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-print("Optimizer initialized:", optimizer)
-
-# %%
-# %% [define loss]
-criterion = torch.nn.BCEWithLogitsLoss()
-print("Loss function defined:", criterion)
-
-# %%
-# %% [debug forward]
-# Test model forward pass on dummy data
-dummy_nodes = 5
-dummy_edges = 10
-dummy_x = torch.randn(dummy_nodes, input_dim)
-# Random edge_index for dummy graph
-source = torch.randint(0, dummy_nodes, (dummy_edges,))
-target = torch.randint(0, dummy_nodes, (dummy_edges,))
-dummy_edge_index = torch.stack([source, target], dim=0)
-out = model(dummy_x, dummy_edge_index)
-print("Forward pass on dummy data output shape:", out.shape)
-
-# %% [markdown]
-# # Обучение модели
-
-# %%
-# %% [model training]
-import tensorflow as tf
-from stellargraph.mapper import FullBatchNodeGenerator
-
-# Define the full-batch generator with self-loops
-generator = FullBatchNodeGenerator(
-    G,
-    method="self_loops",
-    sparse=False
-)
-
-# %% [Keras GCN model definition]
-from stellargraph.layer.gcn import GCN as StellarGCN
-from tensorflow.keras import Model
-from tensorflow.keras.layers import Dense
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.losses import categorical_crossentropy
-
-# Build and compile the StellarGraph GCN model
-layer_sizes = [32, 16, 16, 16, 4]
-gcn_keras = StellarGCN(
-    layer_sizes=layer_sizes,
-    activations=["relu"] * len(layer_sizes),
-    generator=generator,
-    dropout=0.5,
-)
-x_inp, x_out = gcn_keras.in_out_tensors()
-prediction = Dense(units=2, activation="softmax")(x_out)
-model = Model(inputs=x_inp, outputs=prediction)
-model.compile(
-    optimizer=Adam(learning_rate=0.005),
-    loss=categorical_crossentropy,
-    metrics=["acc"],
-)
-model.summary()
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from sklearn.metrics import recall_score, precision_score, f1_score, confusion_matrix
-
-# Prepare node labels by merging 'from_scam' and 'to_scam'
-node_labels_from = df.groupby('from_address')['from_scam'].max()
-node_labels_to   = df.groupby('to_address')['to_scam'].max()
-node_labels      = pd.concat([node_labels_from, node_labels_to], axis=1).max(axis=1)
-
-# One-hot encode labels
-node_targets = pd.get_dummies(node_labels.astype(int))
-
-# Stratified split into train, validation, and test sets using sklearn
-from sklearn.model_selection import train_test_split
-
-# First split: 75% train+val, 25% test
-train_val_nodes, test_nodes = train_test_split(
-    node_labels.index,
-    test_size=0.25,
-    stratify=node_labels,
-    random_state=42
-)
-# Second split: of train_val into 2/3 train (50% total) and 1/3 val (25% total)
-train_nodes, val_nodes = train_test_split(
-    train_val_nodes,
-    test_size=1/3,
-    stratify=node_labels.loc[train_val_nodes],
-    random_state=42
-)
-
-train_targets = node_targets.loc[train_nodes].values
-val_targets   = node_targets.loc[val_nodes].values
-test_targets  = node_targets.loc[test_nodes].values
-
-# Create data generators
-train_gen = generator.flow(train_nodes, train_targets)
-val_gen   = generator.flow(val_nodes,   val_targets)
-test_gen  = generator.flow(test_nodes,  test_targets)
-
-# Callbacks for early stopping and learning rate reduction
-early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-reduce_lr  = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
-
-# Train the model
-history = model.fit(
-    train_gen,
-    epochs=100,
-    validation_data=val_gen,
-    verbose=2,
-    shuffle=False,
-    callbacks=[early_stop, reduce_lr]
-)
-
-# Evaluate on test set
-loss, accuracy = model.evaluate(test_gen)
-print(f"Test loss: {loss:.4f}, Test accuracy: {accuracy:.4f}")
-
-# Detailed metrics
-# Get model predictions
-y_pred = model.predict(test_gen)
-
-# Squeeze out the batch dimension if present (full-batch sequence yields shape (1, N, classes))
-if isinstance(y_pred, np.ndarray) and y_pred.ndim == 3:
-    y_pred = y_pred[0]
-
-# Compute predicted classes and true labels
-preds = np.argmax(y_pred, axis=1)
-truths = np.argmax(test_targets, axis=1)
-
-# Print classification metrics
-print("Recall:", recall_score(truths, preds))
-print("Precision:", precision_score(truths, preds))
-print("F1 score:", f1_score(truths, preds))
-print("Confusion Matrix:\n", confusion_matrix(truths, preds))
-
 
 
