@@ -12,6 +12,7 @@ from torch_geometric.data import Data
 import numpy as np
 import random
 import torch
+from sklearn.model_selection import train_test_split
 import pandas as pd
 import shutil
 import os
@@ -315,11 +316,41 @@ edge_df = edge_df[['from_address', 'to_address'] +
 print("DataFrame columns:", df.columns.tolist())
 
 # %%
+# ───────────── Подготовка меток и разбиение ─────────────
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
+
+# 1) метка «хотя бы одна отметка scam у узла»
+from_label = df.groupby("from_address")["from_scam"].max()
+to_label = df.groupby("to_address")["to_scam"].max()
+
+node_label = (
+    from_label.reindex(node_df.index, fill_value=0).astype(int)
+    | to_label.reindex(node_df.index, fill_value=0).astype(int)
+)
+
+# 2) train / val / test = 50 / 25 / 25 %, стратифицированно
+train_ids, rest_ids = train_test_split(
+    node_df.index,
+    train_size=0.5,
+    stratify=node_label,
+    random_state=SEED,
+)
+val_ids, test_ids = train_test_split(
+    rest_ids,
+    train_size=0.5,
+    stratify=node_label.reindex(rest_ids),
+    random_state=SEED,
+)
+
+print(
+    f"train / val / test sizes: {len(train_ids)} | {len(val_ids)} | {len(test_ids)}")
+
+# %%
+
 
 # 1) ─────────────── Подготовка графа ──────────────────────────
 #   node_df     – как в вашем пайплайне (index = address)
@@ -376,7 +407,8 @@ class GraphSAGE(torch.nn.Module):
     def __init__(self, in_ch, dropout=0.5):
         super().__init__()
         self.convs = torch.nn.ModuleList([
-            SAGEConv(in_ch, 32, aggr="mean"),
+            SAGEConv(in_ch, 4),
+            SAGEConv(4, 32, aggr="mean"),
             SAGEConv(32, 16, aggr="mean"),
             SAGEConv(16, 16, aggr="mean"),
             SAGEConv(16, 16, aggr="mean"),
@@ -402,12 +434,14 @@ data = data.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
 loss_fn = torch.nn.NLLLoss()
 
+print(model)
+
 # %% [markdown]
 # # Обучение модели
 
 # %%
 # 3) ─────────────── Обучение ─────────────────────────────────
-EPOCHS = 20
+EPOCHS = 50
 for epoch in range(1, EPOCHS + 1):
     model.train()
     optimizer.zero_grad()
