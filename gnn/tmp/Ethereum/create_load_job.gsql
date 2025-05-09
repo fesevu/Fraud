@@ -1,0 +1,9 @@
+USE GRAPH Ethereum
+
+# Define data loading job
+CREATE LOADING JOB load_ethereum FOR GRAPH Ethereum {
+    DEFINE FILENAME acct_csv;
+    DEFINE FILENAME tx_csv;
+    LOAD acct_csv TO VERTEX Account VALUES($0, $1, _, _, _, _, _, _, _, _, _, _) USING SEPARATOR=",", HEADER="false";
+    LOAD tx_csv TO EDGE Transaction VALUES($0, $1, $2, $3) USING SEPARATOR=",", HEADER="false";
+}

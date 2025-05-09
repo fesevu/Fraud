@@ -1,0 +1,21 @@
+CREATE GRAPH Ethereum()
+
+USE GRAPH Ethereum
+
+# Set up schema
+CREATE SCHEMA_CHANGE JOB ethereum_schema FOR GRAPH Ethereum {
+	ADD VERTEX Account(PRIMARY_ID account_id STRING, is_fraud BOOL, in_degree INT, out_degree INT, send_min DOUBLE, send_amount DOUBLE, recv_min DOUBLE, recv_amount DOUBLE, pagerank DOUBLE, is_training BOOL, is_testing BOOL, is_validation BOOL) WITH STATS="OUTDEGREE_BY_EDGETYPE", PRIMARY_ID_AS_ATTRIBUTE="true";
+	ADD DIRECTED EDGE Transaction(FROM Account, TO Account, amount FLOAT, timestamp STRING) WITH REVERSE_EDGE="reverse_Transaction";
+}
+
+RUN SCHEMA_CHANGE JOB ethereum_schema
+
+# Load data
+CREATE LOADING JOB load_ethereum FOR GRAPH Ethereum {
+    DEFINE FILENAME acct_csv="./data/account.csv";
+    DEFINE FILENAME tx_csv="./data/transaction.csv";
+    LOAD acct_csv TO VERTEX Account VALUES($0, $1, _, _, _, _, _, _, _, _, _, _) USING SEPARATOR=",", HEADER="false", EOL="\n";
+    LOAD tx_csv TO EDGE Transaction VALUES($0, $1, $2, $3) USING SEPARATOR=",", HEADER="false", EOL="\n";
+}
+
+RUN LOADING JOB load_ethereum

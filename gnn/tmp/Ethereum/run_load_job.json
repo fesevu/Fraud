@@ -1,0 +1,12 @@
+[
+    {
+        "filePath": "account.csv",
+        "fileTag": "acct_csv",
+        "jobName": "load_ethereum"
+    },
+    {
+        "filePath": "transaction.csv",
+        "fileTag": "tx_csv",
+        "jobName": "load_ethereum"
+    }
+]
