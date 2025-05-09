@@ -1,7 +1,9 @@
 .venv
 kaggle.json
+config.json
 data
 artifacts
 checkpoints
 *-old.py
 *DS_Store
+tmp
