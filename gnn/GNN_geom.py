@@ -1,19 +1,16 @@
 # %%
-%pip uninstall pyg-lib torch-sparse -y
+%pip uninstall torch torch_geometric torch_scatter torch_sparse pyg_lib torch_cluster torch_spline_conv -y
 # 2.1 PyTorch (CPU) – подмените индекс, если нужна CUDA
-%pip install torch==2.6.0 torchvision torchaudio
+%pip install torch==2.3.0
 
 # 2.2 PyG: с 2.3+ внешних библиотек почти нет, ставим одной строкой
-%pip install torch_geometric 
-%pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.6.0+cpu.html
+%pip install torch_geometric
+%pip install torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.3.0+cpu.html
 
 
 # 2.4 остальное
 %pip install xgboost pandas matplotlib graphviz scikit-learn tqdm numpy networkx seaborn
 
-# 2.5 если drawSchema выдаёт ошибку “Graphviz executable not found”:
-#   Ubuntu: sudo apt-get install graphviz
-#   macOS:  brew install graphviz
 
 # %%
 from pathlib import Path
@@ -23,8 +20,16 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 from torch_geometric.utils import from_networkx
+from torch_geometric.nn import Node2Vec
+from torch_geometric.utils import to_undirected
+import math
+import torch_cluster
 
 print(torch.__version__)
+
+# %%
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # %% [markdown]
 # # Чтение датасета
@@ -89,6 +94,102 @@ for n in G.nodes():
         'clustering':  clust[n],
     })
 
+# --- после расчёта pr и clust --------------------------------------------
+print('⏳ Calculating extra graph features…')
+
+# 1) Betweenness (approx)
+btw = nx.betweenness_centrality(G, k=10_000, seed=42, normalized=True)
+
+# 2) Weakly-connected component size
+G_u = G.to_undirected()
+wcc = {n: 0 for n in G}
+for comp in nx.connected_components(G_u):
+    size = len(comp)
+    for n in comp:
+        wcc[n] = size
+
+# 3) Min amounts
+send_min = {n: math.inf for n in G}
+recv_min = {n: math.inf for n in G}
+for u, v, d in G.edges(data=True):
+    amt = d['amount']
+    send_min[u] = min(send_min[u], amt)
+    recv_min[v] = min(recv_min[v], amt)
+# заменяем inf → 0.0 (узлы без операций)
+send_min = {n: 0.0 if math.isinf(v) else v for n, v in send_min.items()}
+recv_min = {n: 0.0 if math.isinf(v) else v for n, v in recv_min.items()}
+
+# --- записываем все новые фичи в вершины ----------------------------------
+for n in G.nodes():
+    G.nodes[n].update({
+        'btw_centr':   btw[n],
+        'wcc_size':    wcc[n],
+        'send_min':    send_min[n],
+        'recv_min':    recv_min[n],
+    })
+
+# %%
+ # --- перед обучением Node2Vec: создаём маппинг id → idx -------------------
+id2idx = {n: i for i, n in enumerate(G.nodes())}
+
+# --- строим edge_index по числовым индексам ------------------------------
+edges = list(G.edges())
+row = [id2idx[u] for u, v in edges]
+col = [id2idx[v] for u, v in edges]
+edge_index = torch.tensor([row, col], dtype=torch.long)
+edge_index = to_undirected(edge_index).contiguous()
+
+# --- теперь обучаем Node2Vec на неориентированном графе --------------------
+print('⏳ Training Node2Vec…')
+n2v = Node2Vec(
+    edge_index=edge_index,
+    num_nodes=G.number_of_nodes(),
+    embedding_dim=128,
+    walk_length=20,
+    context_size=10,
+    walks_per_node=5,
+    num_negative_samples=1,
+    sparse=True,
+    p=1, q=1
+).to(device)
+
+loader = n2v.loader(batch_size=1024, shuffle=True)
+opt = torch.optim.SparseAdam(list(n2v.parameters()), lr=0.01)
+
+n2v.train()
+for epoch in range(40):  # можете увеличить число эпох
+    total_loss = 0
+    for pos_rw, neg_rw in loader:
+        opt.zero_grad()
+        loss = n2v.loss(pos_rw.to(device), neg_rw.to(device))
+        loss.backward()
+        opt.step()
+        total_loss += loss.item()
+    print(f'Epoch {epoch+1}, Loss {total_loss:.4f}')
+
+# %%
+# --- извлекаем эмбеддинги и записываем обратно в G ------------------------
+z = n2v.embedding.weight.detach().cpu()
+for n, idx in id2idx.items():
+    G.nodes[n]['n2v'] = z[idx]
+
+# --- при формировании data.x ---------------------------------------------
+# Наконец, собираем x
+num_attr_keys = [
+    'in_deg','out_deg','sent_sum','recv_sum','net_sum',
+    'pagerank','clustering',
+    'btw_centr','wcc_size','send_min','recv_min'
+]
+
+for n in G.nodes():
+    # проверяем, что всё есть
+    missing = [k for k in num_attr_keys if k not in G.nodes[n]]
+    if missing:
+        raise RuntimeError(f"У узла {n} нет фичей {missing}")
+    base = [float(G.nodes[n][k]) for k in num_attr_keys]
+    emb  = G.nodes[n]['n2v'].tolist()           # 128-мерный эмбеддинг
+    G.nodes[n]['x'] = torch.tensor(base + emb, dtype=torch.float)
+
 print('Пример фич узла:', list(G.nodes(data=True))[0])
 
 # %%
@@ -96,6 +197,15 @@ print('Пример фич узла:', list(G.nodes(data=True))[0])
 nx.set_node_attributes(G, -1, "label")        # сначала всем ставим -1
 for _, row in acc_df.iterrows():              # затем переопределяем тем, что есть в accounts.csv
     G.nodes[row.id]["label"] = int(bool(row.label))   
+
+# %%
+# после формирования всех численных признаков, до отправки в PyG
+from sklearn.preprocessing import StandardScaler
+X = np.stack([G.nodes[n]['x'].numpy() for n in G.nodes()])
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+for n, vec in zip(G.nodes(), X):
+    G.nodes[n]['x'] = torch.tensor(vec, dtype=torch.float)
 
 # %% [markdown]
 # ## 🔄 Конвертация в `torch_geometric.data.Data`
@@ -109,27 +219,113 @@ for n in G.nodes():
 data = from_networkx(G, group_node_attrs=['x'])
 data.y = torch.tensor([G.nodes[n].get('label', -1) for n in G.nodes()], dtype=torch.long)
 
+print("Num features:", data.num_node_features)  
 print(data)
+
+# %%
+import torch
+
+# 1) Список «старых» фичей уже в data.x: shape [N,7]
+X_base = data.x                # float32, device может быть CPU или CUDA
+
+# 2) Достаём остальные скалярные фичи и приводим к форме [N,1]
+btw      = data.btw_centr.view(-1,1)   # [N] → [N,1]
+wcc      = data.wcc_size.view(-1,1)
+send_min = data.send_min.view(-1,1)
+recv_min = data.recv_min.view(-1,1)
+
+# 3) Node2Vec: shape [N,128]
+X_n2v    = data.n2v               # уже [N,128]
+
+# 4) Конкатенируем всё в один [N, 7+4+128 = 139]
+data.x = torch.cat([X_base, btw, wcc, send_min, recv_min, X_n2v], dim=1)
+
+print("Now num features:", data.x.size(1))  # должно быть 139
+
+# %%
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+# 1) выгружаем data.x в NumPy
+X = data.x.cpu().numpy()   # shape [N,139]
+
+# 2) лог-трансформации неотрицательных признаков
+log_idxs = [0,1,2,3,7,8,9,10]
+X[:, log_idxs] = np.log1p(X[:, log_idxs])
+
+# 3) чистим NaN/Inf → конечные числа
+#    nan → 0.0, +inf → max_float32, -inf → min_float32
+X = np.nan_to_num(
+    X,
+    nan=0.0,
+    posinf=np.finfo(np.float32).max,
+    neginf=np.finfo(np.float32).min
+)
+
+# (можно проверить, что теперь все конечные)
+assert np.isfinite(X).all(), "Есть ещё не-конечные элементы!"
+
+# 4) стандартизация
+scaler = StandardScaler()
+X = scaler.fit_transform(X)
+
+# 5) обратно в TorchTensor
+import torch
+data.x = torch.tensor(X, dtype=torch.float32).to(device)
 
 # %% [markdown]
 # ## ✂️ Train / Val / Test сплит
 
 # %%
-torch.manual_seed(42)
-N = data.num_nodes
-perm = torch.randperm(N)
-n_train = int(0.6 * N)
-n_val   = int(0.2 * N)
+import hashlib
+import numpy as np
+import torch
 
-data.train_mask = torch.zeros(N, dtype=torch.bool)
-data.val_mask   = torch.zeros(N, dtype=torch.bool)
-data.test_mask  = torch.zeros(N, dtype=torch.bool)
+# 1) Собираем список узлов в порядке G.nodes()
+nodes = list(G.nodes())
 
-data.train_mask[perm[:n_train]]           = True
-data.val_mask[perm[n_train:n_train+n_val]] = True
-data.test_mask[perm[n_train+n_val:]]      = True
+# 2) Хешируем каждый ID (md5 → целое), берём mod 100 → [0..99]
+hash_vals = np.array([
+    int(hashlib.md5(str(n).encode()).hexdigest(), 16) % 100
+    for n in nodes
+])
 
-print(f'Train: {data.train_mask.sum().item()}, Val: {data.val_mask.sum().item()}, Test: {data.test_mask.sum().item()}')
+# 3) Порог: [0,59] → train, [60,79] → val, [80,99] → test
+train_mask = torch.tensor(hash_vals < 60, dtype=torch.bool)
+val_mask   = torch.tensor((hash_vals >= 60) & (hash_vals < 80), dtype=torch.bool)
+test_mask  = torch.tensor(hash_vals >= 80, dtype=torch.bool)
+
+# 4) Привязываем к data
+data.train_mask = train_mask
+data.val_mask   = val_mask
+data.test_mask  = test_mask
+
+# Проверим доли
+print(f"Train: {train_mask.sum().item()/len(nodes):.2%}, "
+      f"Val: {val_mask.sum().item()/len(nodes):.2%}, "
+      f"Test: {test_mask.sum().item()/len(nodes):.2%}")
+
+train_loader = NeighborLoader(
+    data,
+    input_nodes=data.train_mask,        # корневые узлы для train
+    num_neighbors=[25, 15],             # сколько соседей на каждом слое
+    batch_size=1024,
+    shuffle=True,
+)
+val_loader = NeighborLoader(
+    data,
+    input_nodes=data.val_mask,
+    num_neighbors=[25, 15],
+    batch_size=1024,
+    shuffle=False,
+)
+test_loader = NeighborLoader(
+    data,
+    input_nodes=data.test_mask,
+    num_neighbors=[25, 15],
+    batch_size=1024,
+    shuffle=False,
+)
 
 # %%
 OUT_PATH = Path('./artifacts/eth_graph.pt')
@@ -141,14 +337,16 @@ print(f'Сериализовано в {OUT_PATH.resolve()}')
 # ## 🧠 Определение GNN‑модели (GCN)
 
 # %%
-from torch_geometric.nn import GCNConv
 import torch.nn.functional as F
+from torch_geometric.nn import SAGEConv
 
-class GCN(torch.nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int, num_classes: int):
+
+# 1) Определяем GraphSAGE
+class GraphSAGE(torch.nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_classes):
         super().__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, num_classes)
+        self.conv1 = SAGEConv(in_channels, hidden_channels)
+        self.conv2 = SAGEConv(hidden_channels, num_classes)
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
@@ -156,59 +354,58 @@ class GCN(torch.nn.Module):
         x = self.conv2(x, edge_index)
         return x
 
-print('GCN model ready')
-
 # %% [markdown]
 # ## 🏃‍♂️ Обучение и валидация
 
 # %%
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = GCN(data.num_node_features, 64, int(data.y.max().item()) + 1).to(device)
 data = data.to(device)
 
+labels = data.y[data.y != -1]
+counts = torch.bincount(labels)
+weight = torch.tensor([1.0, counts[0].float() / counts[1].float()], device=device)
+print(f"Class weights: normal={weight[0]:.2f}, fraud={weight[1]:.2f}")
+
+# 3) Инициализируем модель, optimizer, criterion (с весами из шага 2)
+model = GraphSAGE(data.num_node_features, 64, int(data.y.max().item())+1).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
-criterion = torch.nn.CrossEntropyLoss()
+criterion = torch.nn.CrossEntropyLoss(weight=weight, ignore_index=-1)
 
-labeled = (data.y != -1)
-perm = torch.randperm(int(labeled.sum()))
-idx  = labeled.nonzero(as_tuple=False).view(-1)[perm]
-
-n_train = int(0.6 * len(idx))
-n_val   = int(0.2 * len(idx))
-
-data.train_mask[:] = False
-data.val_mask[:]   = False
-data.test_mask[:]  = False
-
-data.train_mask[idx[:n_train]]           = True
-data.val_mask[idx[n_train:n_train+n_val]] = True
-data.test_mask[idx[n_train+n_val:]]      = True
-
-def train():
+# 4) Цикл обучения
+def train_epoch():
     model.train()
-    optimizer.zero_grad()
-    out = model(data.x, data.edge_index)
-    loss = criterion(out[data.train_mask], data.y[data.train_mask])
-    loss.backward()
-    optimizer.step()
-    return loss.item()
+    total_loss = 0
+    for batch in train_loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+        out = model(batch.x, batch.edge_index)
+        # только первые batch.batch_size предсказаний — для корневых узлов
+        loss = criterion(out[:batch.batch_size], batch.y[:batch.batch_size])
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * batch.batch_size
+    return total_loss / int(data.train_mask.sum())
 
 @torch.no_grad()
-def accuracy(mask):
+def eval_loader(loader):
     model.eval()
-    logits = model(data.x, data.edge_index)
-    preds = logits.argmax(dim=1)
-    correct = (preds[mask] == data.y[mask]).sum().item()
-    return correct / int(mask.sum())
+    correct = total = 0
+    for batch in loader:
+        batch = batch.to(device)
+        out = model(batch.x, batch.edge_index)
+        preds = out[:batch.batch_size].argmax(dim=1)
+        y = batch.y[:batch.batch_size]
+        correct += int((preds == y).sum())
+        total   += batch.batch_size
+    return correct / total
 
-for epoch in range(1, 201):
-    loss = train()
-    if epoch % 10 == 0:
-        train_acc = accuracy(data.train_mask)
-        val_acc = accuracy(data.val_mask)
-        print(f'Epoch {epoch:03d} | Loss {loss:.4f} | Train Acc {train_acc:.3f} | Val Acc {val_acc:.3f}')
+for epoch in range(1, 51):
+    loss = train_epoch()
+    train_acc = eval_loader(train_loader)
+    val_acc   = eval_loader(val_loader)
+    print(f'Epoch {epoch:02d} | Loss {loss:.4f} | Train Acc {train_acc:.3f} | Val Acc {val_acc:.3f}')
 
-test_acc = accuracy(data.test_mask)
+test_acc = eval_loader(test_loader)
 print(f'✅ Test Accuracy: {test_acc:.3f}')
 
 # %% [markdown]
