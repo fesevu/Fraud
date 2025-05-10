@@ -295,10 +295,16 @@ train_mask = torch.tensor(hash_vals < 60, dtype=torch.bool)
 val_mask   = torch.tensor((hash_vals >= 60) & (hash_vals < 80), dtype=torch.bool)
 test_mask  = torch.tensor(hash_vals >= 80, dtype=torch.bool)
 
-# 4) Привязываем к data
-data.train_mask = train_mask
-data.val_mask   = val_mask
-data.test_mask  = test_mask
+# после заполнения data.y (с -1 для неметочных) и до создания loader’ов
+label_mask = data.y != -1               # булевый тензор: True там, где есть 0/1
+train_mask = (hash_vals < 60)  & label_mask.cpu().numpy()
+val_mask   = ((hash_vals >= 60) & (hash_vals < 80)) & label_mask.cpu().numpy()
+test_mask  = (hash_vals >= 80) & label_mask.cpu().numpy()
+
+# преобразуем обратно в torch.bool
+data.train_mask = torch.tensor(train_mask, dtype=torch.bool, device=device)
+data.val_mask   = torch.tensor(val_mask,   dtype=torch.bool, device=device)
+data.test_mask  = torch.tensor(test_mask,  dtype=torch.bool, device=device)
 
 # Проверим доли
 print(f"Train: {train_mask.sum().item()/len(nodes):.2%}, "
@@ -308,24 +314,25 @@ print(f"Train: {train_mask.sum().item()/len(nodes):.2%}, "
 train_loader = NeighborLoader(
     data,
     input_nodes=data.train_mask,        # корневые узлы для train
-    num_neighbors=[25, 15],             # сколько соседей на каждом слое
+    num_neighbors=[200, 200],             # сколько соседей на каждом слое
     batch_size=1024,
     shuffle=True,
 )
 val_loader = NeighborLoader(
     data,
     input_nodes=data.val_mask,
-    num_neighbors=[25, 15],
+    num_neighbors=[200, 200],
     batch_size=1024,
     shuffle=False,
 )
 test_loader = NeighborLoader(
     data,
     input_nodes=data.test_mask,
-    num_neighbors=[25, 15],
+    num_neighbors=[200, 200],
     batch_size=1024,
     shuffle=False,
 )
+
 
 # %%
 OUT_PATH = Path('./artifacts/eth_graph.pt')
@@ -347,19 +354,22 @@ class GraphSAGE(torch.nn.Module):
         super().__init__()
         self.conv1 = SAGEConv(in_ch, hidden_ch)
         self.conv2 = SAGEConv(hidden_ch, out_ch)
-        self.dropout = torch.nn.Dropout(dropout)
+        self.dropout1 = torch.nn.Dropout(dropout)
+        self.dropout2 = torch.nn.Dropout(dropout)
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
         x = F.relu(x)
-        x = self.dropout(x)
+        x = self.dropout1(x)
         x = self.conv2(x, edge_index)
+        x = self.dropout2(x)
         return x
 
 # %% [markdown]
 # ## 🏃‍♂️ Обучение и валидация
 
 # %%
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 data = data.to(device)
 
@@ -373,10 +383,10 @@ model = GraphSAGE(
     in_ch=data.num_node_features,
     hidden_ch=256,
     out_ch=int(data.y.max().item())+1,
-    dropout=0.25
+    dropout=0.45
 ).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-criterion = torch.nn.CrossEntropyLoss(weight=weight, ignore_index=-1)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=1e-3)
+criterion = torch.nn.CrossEntropyLoss(weight=weight)
 
 # 4) Цикл обучения
 def train_epoch():
@@ -386,6 +396,10 @@ def train_epoch():
         batch = batch.to(device)
         optimizer.zero_grad()
         out = model(batch.x, batch.edge_index)
+        y = batch.y[:batch.batch_size]
+        mask = y != -1                    # True для валидных меток
+        if mask.sum() == 0:
+            continue
         # только первые batch.batch_size предсказаний — для корневых узлов
         loss = criterion(out[:batch.batch_size], batch.y[:batch.batch_size])
         loss.backward()
@@ -414,14 +428,94 @@ def eval_loader(loader):
 
     return correct / total if total > 0 else 0.0
 
-for epoch in range(1, 11):
+num_epochs = 30
+train_losses, val_losses = [], []
+train_accs, val_accs     = [], []
+
+# Функция для вычисления средней потери на валидации
+@torch.no_grad()
+def eval_loss(loader):
+    model.eval()
+    total_loss, total = 0.0, 0
+    for batch in loader:
+        batch = batch.to(device)
+        out = model(batch.x, batch.edge_index)
+        logits = out[:batch.batch_size]
+        y = batch.y[:batch.batch_size]
+        mask = (y != -1)
+        if mask.sum() == 0:
+            continue
+        loss = criterion(logits[mask], y[mask])
+        total_loss += loss.item() * mask.sum().item()
+        total += mask.sum().item()
+    return total_loss / total if total > 0 else 0.0
+
+scheduler = ReduceLROnPlateau(optimizer,
+                              mode='min',
+                              factor=0.5,
+                              patience=3,
+                              verbose=True)
+
+best_val_loss = float('inf')
+patience_cnt = 0
+early_stop_patience = 7
+
+for epoch in range(1, num_epochs+1):
     loss = train_epoch()
     train_acc = eval_loader(train_loader)
+    val_loss  = eval_loss(val_loader)
     val_acc   = eval_loader(val_loader)
-    print(f'Epoch {epoch:02d} | Loss {loss:.4f} | Train Acc {train_acc:.3f} | Val Acc {val_acc:.3f}')
+
+    train_losses.append(loss)
+    val_losses.append(val_loss)
+    train_accs.append(train_acc)
+    val_accs.append(val_acc)
+
+    # Шедулер по валидационной потере
+    scheduler.step(val_loss)
+
+    # Early stopping
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), 'best_model.pt')
+        patience_cnt = 0
+    else:
+        patience_cnt += 1
+        if patience_cnt >= early_stop_patience:
+            print(f"Early stopping на эпохе {epoch}")
+            break
+
+    print(f'Epoch {epoch:02d} | Train Loss {loss:.4f} | Val Loss {val_loss:.4f} '
+          f'| Train Acc {train_acc:.3f} | Val Acc {val_acc:.3f}')
+
 
 test_acc = eval_loader(test_loader)
 print(f'✅ Test Accuracy: {test_acc:.3f}')
+
+# %%
+
+# ─── Визуализация кривых обучения ───────────────────────────────────────────────
+import matplotlib.pyplot as plt
+
+epochs = list(range(1, len(train_losses) + 1))  # вместо num_epochs
+plt.figure(figsize=(8,4))
+plt.plot(epochs, train_losses, label='Train Loss')
+plt.plot(epochs, val_losses,   label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.title('Train vs Val Loss')
+plt.show()
+
+plt.figure(figsize=(8,4))
+plt.plot(epochs, train_accs, label='Train Accuracy')
+plt.plot(epochs, val_accs,   label='Val Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.title('Training & Validation Accuracy')
+plt.legend()
+plt.tight_layout()
+plt.show()
 
 # %% [markdown]
 # ## 📊 Визуализация результатов
@@ -462,6 +556,143 @@ plt.show()
 # ## 🕵️‍♂️ Интерпретация предсказаний с **GNNExplainer**
 # Выберем произвольный корректно классифицированный узел из тестовой выборки и посмотрим, какие рёбра и признаки были наиболее важны для модели.
 
+# %%
+# %% 
+# ## 🕵️‍♂️ Интерпретация предсказаний с GNNExplainer (inline, с именами фичей)
+
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from torch_geometric.explain import Explainer, GNNExplainer
+
+# 1) Найти первый корректно классифицированный узел
+model.eval()
+target_node = None
+for batch in test_loader:
+    batch = batch.to(device)
+    out   = model(batch.x, batch.edge_index)
+    preds = out[:batch.batch_size].argmax(dim=1)
+    y     = batch.y[:batch.batch_size]
+    mask  = (y != -1) & (preds == y)
+    if mask.any():
+        idx_local   = mask.nonzero(as_tuple=True)[0][0].item()
+        target_node = batch.n_id[idx_local].item()
+        break
+
+print(f'🔍 Объясняем решение для узла {target_node}')
+
+# 2) Подготовить Explainer
+explainer = Explainer(
+    model=model,
+    algorithm=GNNExplainer(epochs=200),
+    explanation_type='model',
+    node_mask_type='attributes',
+    edge_mask_type='object',
+    model_config=dict(
+        mode='multiclass_classification',
+        task_level='node',
+        return_type='raw',
+    ),
+)
+
+# 3) Сгенерировать Explanation
+explanation = explainer(
+    x=data.x, 
+    edge_index=data.edge_index, 
+    index=target_node,
+)
+
+# 4) Бар-граф топ-10 фич с человеческими названиями
+feat_names = [
+    'in_deg','out_deg','sent_sum','recv_sum','net_sum',
+    'pagerank','clustering',
+    'btw_centr','wcc_size','send_min','recv_min'
+] + [f'n2v_{i}' for i in range(128)]
+
+# расплющиваем в 1D-массив
+feat_imp = explanation.node_mask.cpu().numpy().flatten()
+top_k    = 10
+
+# теперь argsort вернёт одномерный список индексов
+idxs = np.argsort(feat_imp)[-top_k:][::-1].tolist()
+vals = feat_imp[idxs]
+names = [feat_names[i] for i in idxs]
+
+plt.figure(figsize=(8,4))
+plt.barh(names, vals)
+plt.xlabel('Importance')
+plt.title(f'Top {top_k} Feature Importances for node {target_node}')
+plt.gca().invert_yaxis()
+plt.tight_layout()
+plt.show()
+
+# 5) Визуализация объясняющего субграфа как на вашем примере
+
+import numpy as np
+import networkx as nx
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+# Достаём directed edge-mask и edge_index
+edge_mask = explanation.edge_mask.cpu().numpy().flatten()
+E = data.edge_index.cpu().numpy()
+mask = edge_mask > np.percentile(edge_mask, 100 - 20)  # топ-20 самых важных рёбер
+
+# Формируем DiGraph из наиболее важных рёбер
+sub_edges = list(zip(E[0][mask], E[1][mask]))
+G_sub = nx.DiGraph()
+G_sub.add_edges_from(sub_edges)
+
+# Достаём layout
+pos = nx.spring_layout(G_sub, seed=42)
+
+# Рисуем всё inline
+fig, ax = plt.subplots(figsize=(6,6))
+# рамка
+ax.add_patch(Rectangle(
+    ( -1.05, -1.05),   # чуть-чуть за границы layout [-1..1]
+    2.1, 2.1,
+    fill=False, lw=1.5, edgecolor='black'
+))
+
+# узлы
+nx.draw_networkx_nodes(
+    G_sub, pos,
+    ax=ax,
+    node_size=800,
+    node_color='white',
+    edgecolors='black',
+    linewidths=1.2
+)
+
+# стрелки
+nx.draw_networkx_edges(
+    G_sub, pos,
+    ax=ax,
+    arrowstyle='-|>',
+    arrowsize=12,
+    width=1.2,
+    edge_color='black',
+    connectionstyle='arc3,rad=0.1'
+)
+
+# подписи внутри кружков
+nx.draw_networkx_labels(
+    G_sub, pos,
+    ax=ax,
+    labels={n:str(n) for n in G_sub.nodes()},
+    font_size=10
+)
+
+ax.set_xticks([])
+ax.set_yticks([])
+ax.set_xlim(-1.1, 1.1)
+ax.set_ylim(-1.1, 1.1)
+ax.axis('off')
+plt.title(f'Explanation Subgraph for node {target_node}', pad=15)
+plt.tight_layout()
+plt.show()
+
 # %% [markdown]
 # ## 💾 Сохранение обученной модели
 
@@ -470,5 +701,87 @@ MODEL_PATH = Path('./checkpoints/gcn_model.pt')
 MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
 torch.save(model.state_dict(), MODEL_PATH)
 print(f'Модель сохранена в {MODEL_PATH.resolve()}')
+
+# %%
+import torch
+import pickle
+import numpy as np
+from pathlib import Path
+
+# 1) Папка для артефактов
+artifacts_dir = Path("./artifacts")
+artifacts_dir.mkdir(exist_ok=True)
+
+# 2) Внутри цикла обучения (при early stopping) сохраняем лучшие весa
+best_val_loss = float('inf')
+for epoch in range(1, num_epochs+1):
+    train_epoch()
+    val_loss = eval_loss(val_loader)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(
+            model.state_dict(),
+            artifacts_dir / "gcn_best_weights.pt"
+        )
+        print(f"[Epoch {epoch}] Сохранили лучшие веса (val_loss={val_loss:.4f})")
+
+# 3) После окончания обучения сохраняем:
+# 3.1) финальные веса
+torch.save(
+    model.state_dict(),
+    artifacts_dir / "gcn_final_weights.pt"
+)
+print("Финальные веса сохранены в artifacts/gcn_final_weights.pt")
+
+# 3.2) весь объект модели (если нужно удобно загрузить без объявления класса)
+torch.save(
+    model,
+    artifacts_dir / "gcn_model_full.pt"
+)
+print("Полная модель сохранена в artifacts/gcn_model_full.pt")
+
+# 3.3) scaler (StandardScaler из sklearn)
+with open(artifacts_dir / "scaler.pkl", "wb") as f:
+    pickle.dump(scaler, f)
+print("Scaler сохранён в artifacts/scaler.pkl")
+
+# 3.4) список фичей в том же порядке, что вы собирали в x
+#      возьмите ваш DATA_FEATS список (или просто data.num_node_features названий)
+feature_list = feat_names  # например ['in_degree','out_degree',…,'wcc_size']
+with open(artifacts_dir / "features_list.pkl", "wb") as f:
+    pickle.dump(feature_list, f)
+print("Список признаков сохранён в artifacts/features_list.pkl")
+
+# 4) Сохранение эмбеддингов (Node2Vec или финальных x-векторов)
+#    — либо берём z = n2v.embedding.weight.detach().cpu().numpy()
+#    — либо ваши итоговые node representations data.x.cpu().numpy()
+embeddings = n2v.embedding.weight.detach().cpu().numpy()
+np.save(artifacts_dir / "node2vec_embeddings.npy", embeddings)
+print("Эмбеддинги сохранены в artifacts/node2vec_embeddings.npy")
+
+# %% [markdown]
+# # Загрузка модели
+
+# %%
+# 1) Модель и весa
+model = GraphSAGE(...)    # объявить ту же архитектуру
+model.load_state_dict(torch.load("./artifacts/gcn_best_weights.pt"))
+model.eval()
+
+# или, если вы сохраняли весь объект:
+model = torch.load("./artifacts/gcn_model_full.pt")
+model.eval()
+
+# 2) Scaler
+with open("./artifacts/scaler.pkl","rb") as f:
+    scaler = pickle.load(f)
+
+# 3) Список фичей
+with open("./artifacts/features_list.pkl","rb") as f:
+    feature_list = pickle.load(f)
+
+# 4) Эмбеддинги
+embeddings = np.load("./artifacts/node2vec_embeddings.npy")
 
 
