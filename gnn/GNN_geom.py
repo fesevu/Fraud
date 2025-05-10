@@ -393,11 +393,19 @@ def eval_loader(loader):
     for batch in loader:
         batch = batch.to(device)
         out = model(batch.x, batch.edge_index)
-        preds = out[:batch.batch_size].argmax(dim=1)
+        logits = out[:batch.batch_size]
         y = batch.y[:batch.batch_size]
-        correct += int((preds == y).sum())
-        total   += batch.batch_size
-    return correct / total
+
+        # Только размеченные
+        mask = (y != -1)
+        if mask.sum() == 0:
+            continue
+
+        preds = logits.argmax(dim=1)
+        correct += int((preds[mask] == y[mask]).sum())
+        total   += int(mask.sum())
+
+    return correct / total if total > 0 else 0.0
 
 for epoch in range(1, 51):
     loss = train_epoch()
@@ -417,13 +425,22 @@ from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 
+from sklearn.metrics import classification_report
+
 model.eval()
-logits = model(data.x, data.edge_index)
-preds  = logits.argmax(dim=1)
+all_preds, all_labels = [], []
+for batch in test_loader:
+    batch = batch.to(device)
+    out = model(batch.x, batch.edge_index)
+    logits = out[:batch.batch_size]
+    y = batch.y[:batch.batch_size]
+    mask = (y != -1)
 
-mask = (data.test_mask) & (data.y != -1)
-y_true, y_pred = data.y[mask].cpu(), preds[mask].cpu()
+    all_preds.append(logits.argmax(dim=1)[mask].cpu())
+    all_labels.append(y[mask].cpu())
 
+y_true = torch.cat(all_labels).numpy()
+y_pred = torch.cat(all_preds).numpy()
 print(classification_report(y_true, y_pred, digits=3))
 
 cm = confusion_matrix(y_true, y_pred)
