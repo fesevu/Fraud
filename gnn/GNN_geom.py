@@ -157,7 +157,7 @@ loader = n2v.loader(batch_size=1024, shuffle=True)
 opt = torch.optim.SparseAdam(list(n2v.parameters()), lr=0.01)
 
 n2v.train()
-for epoch in range(40):  # можете увеличить число эпох
+for epoch in range(25):  # можете увеличить число эпох
     total_loss = 0
     for pos_rw, neg_rw in loader:
         opt.zero_grad()
@@ -343,14 +343,16 @@ from torch_geometric.nn import SAGEConv
 
 # 1) Определяем GraphSAGE
 class GraphSAGE(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, num_classes):
+    def __init__(self, in_ch, hidden_ch, out_ch, dropout=0.25):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, num_classes)
+        self.conv1 = SAGEConv(in_ch, hidden_ch)
+        self.conv2 = SAGEConv(hidden_ch, out_ch)
+        self.dropout = torch.nn.Dropout(dropout)
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
         x = F.relu(x)
+        x = self.dropout(x)
         x = self.conv2(x, edge_index)
         return x
 
@@ -367,8 +369,13 @@ weight = torch.tensor([1.0, counts[0].float() / counts[1].float()], device=devic
 print(f"Class weights: normal={weight[0]:.2f}, fraud={weight[1]:.2f}")
 
 # 3) Инициализируем модель, optimizer, criterion (с весами из шага 2)
-model = GraphSAGE(data.num_node_features, 64, int(data.y.max().item())+1).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+model = GraphSAGE(
+    in_ch=data.num_node_features,
+    hidden_ch=256,
+    out_ch=int(data.y.max().item())+1,
+    dropout=0.25
+).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 criterion = torch.nn.CrossEntropyLoss(weight=weight, ignore_index=-1)
 
 # 4) Цикл обучения
@@ -407,7 +414,7 @@ def eval_loader(loader):
 
     return correct / total if total > 0 else 0.0
 
-for epoch in range(1, 51):
+for epoch in range(1, 11):
     loss = train_epoch()
     train_acc = eval_loader(train_loader)
     val_acc   = eval_loader(val_loader)
