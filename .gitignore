@@ -1,6 +1,7 @@
 .venv
 kaggle.json
 config.json
+ethereal-fraud-1c4b93baea54.json
 data
 artifacts
 checkpoints
