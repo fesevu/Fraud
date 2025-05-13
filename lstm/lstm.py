@@ -5,34 +5,12 @@
 #     chex optax fastai spacy tensorstore numba \
 #     umap-learn pynndescent librosa shap cuml-cu12 cudf-cu12 dask-cuda
 
-import tensorflow as tf
-import seaborn as sns
-import random
-import importlib
-from pathlib import Path
-import pickle
-from tensorflow.keras.callbacks import ModelCheckpoint
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-import matplotlib.pyplot as plt
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.layers import LSTM, Dense
-from tensorflow.keras.models import Sequential
-from sklearn.preprocessing import MinMaxScaler
-from imblearn.over_sampling import SMOTE
-from sklearn.model_selection import train_test_split
-import numpy as np
-from kaggle.api.kaggle_api_extended import KaggleApi
-import zipfile
-import pandas as pd
-import pathlib
-import json
-import os
-%pip install - U threadpoolctl joblib
-# %pip install --force-reinstall numpy==1.26.4
-%pip install - -upgrade scikit-learn
-%pip install - U imbalanced-learn
+%pip install -U threadpoolctl joblib
+#%pip install --force-reinstall numpy==1.26.4
+%pip install --upgrade scikit-learn
+%pip install -U imbalanced-learn
 
-%pip install - -upgrade - -force-reinstall \
+%pip install --upgrade --force-reinstall \
     numpy \
     scipy \
     matplotlib \
@@ -41,6 +19,7 @@ import os
     tensorflow
 
 # %%
+import importlib, random, os, numpy as np, tensorflow as tf
 
 print("===== VERSIONS =====")
 for lib in ("numpy", "pandas", "sklearn", "imblearn",
@@ -49,8 +28,7 @@ for lib in ("numpy", "pandas", "sklearn", "imblearn",
     print(f"{lib:17s}: {m.__version__}")
 
 print("\n===== TensorFlow devices =====")
-# ← здесь будет только CPU, и это нормально
-print(tf.config.list_physical_devices())
+print(tf.config.list_physical_devices())   # ← здесь будет только CPU, и это нормально
 
 SEED = 42
 random.seed(SEED)
@@ -64,7 +42,7 @@ print(f"\nRandom seed set to {SEED}")
 # 0. (если делали раньше, шаги с pip и токеном можно пропустить)
 
 # — 0.1 Установка библиотеки kaggle —
-%pip install - -quiet kaggle
+%pip install --quiet kaggle
 
 # # — 0.2 Загрузка kaggle.json (один раз за сессию Colab) —
 # #    Если токен уже лежит в ~/.kaggle, эту строку можно пропустить.
@@ -83,13 +61,18 @@ print(f"\nRandom seed set to {SEED}")
 # else:
 #     print("🔑 kaggle.json уже настроен")
 
+import os
+import json
+import pathlib
+import pandas as pd
+import zipfile
+from kaggle.api.kaggle_api_extended import KaggleApi
 
 # 1. Убедимся, что у нас есть файл kaggle.json (с токеном Kaggle)
 kaggle_json_path = '../kaggle.json'
 
 if not os.path.exists(kaggle_json_path):
-    raise FileNotFoundError(
-        "Файл 'kaggle.json' не найден. Пожалуйста, скачайте его с вашего аккаунта Kaggle.")
+    raise FileNotFoundError("Файл 'kaggle.json' не найден. Пожалуйста, скачайте его с вашего аккаунта Kaggle.")
 
 # 2. Конфигурируем API Kaggle с использованием токена
 with open(kaggle_json_path) as f:
@@ -105,11 +88,11 @@ api.authenticate()
 # 1. Скачиваем архив датасета
 slug = "vagifa/ethereum-frauddetection-dataset"
 print(f"\n⬇️ Скачиваю датасет {slug} ...")
-!kaggle datasets download - d {slug} - p ./data - -force - -quiet
+!kaggle datasets download -d {slug} -p ./data --force --quiet
 
 # 2. Распаковываем
 print("📦 Распаковываю ...")
-!unzip - o ./data/*.zip - d ./data > /dev/null
+!unzip -o ./data/*.zip -d ./data > /dev/null
 
 # 3. Открываем transactions.csv
 csv_path = "./data/transactions.csv"
@@ -133,17 +116,46 @@ display(df.head())
 
 print("\n===== Классовое соотношение (isFraud) =====")
 if "FLAG" in df.columns:
-    display((df["FLAG"].value_counts(normalize=True)
-            * 100).round(2).rename("%"))
+    display((df["FLAG"].value_counts(normalize=True) * 100).round(2).rename("%"))
 else:
     print("Столбец 'FLAG' не найден — проверьте структуру датасета.")
 
 # %%
-df.drop(columns=["Unnamed: 0", "Index"], inplace=True, errors="ignore")
+import pandas as pd
+df = pd.read_csv('../dataset/data2/lstm_dataset_address.csv')
+
+# 4. Отладочная информация
+print("\n===== SHAPE =====")
+print(df.shape)
+
+print("\n===== HEAD (5 строк) =====")
+display(df.head())
+
+print("\n===== Классовое соотношение (isFraud) =====")
+if "FLAG" in df.columns:
+    display((df["FLAG"].value_counts(normalize=True) * 100).round(2).rename("%"))
+else:
+    print("Столбец 'FLAG' не найден — проверьте структуру датасета.")
+
+# %%
+import pandas as pd
+
+# Загрузка датасета
+df = pd.read_csv('../dataset/data2/lstm_dataset_address.csv')
+
+df['FLAG'] = df['FLAG'].map({'scam': 1, 'legit': 0})
+df = df[df['is_contract']==False]
+
+print(df.shape)
+
+
+# %%
+df.drop(columns=["Unnamed: 0", "Index", "FLAG_NUM", "is_contract", "scam_type"], inplace=True, errors="ignore")
 df['FLAG'].value_counts(normalize=True)
 
 # %%
 # === @title Этап 3: первичный анализ и инвентаризация признаков ===
+import pandas as pd, numpy as np, matplotlib.pyplot as plt, seaborn as sns
 
 # 0) Копируем исходный df (на всякий случай)
 df_eda = df.copy()
@@ -174,19 +186,43 @@ plt.title("Correlation heatmap (numeric features)")
 plt.show()
 
 # 4) Признаки с нулевой дисперсией (постоянные значения)
-zero_var = df_eda[num_cols].loc[:,
-                                df_eda[num_cols].nunique() == 1].columns.tolist()
+zero_var = df_eda[num_cols].loc[:, df_eda[num_cols].nunique() == 1].columns.tolist()
 print(f"\n===== Признаки с нулевой дисперсией (n={len(zero_var)}) =====")
 print(zero_var)
 
 # 5) Быстрый взгляд на распределение классов (FLAG)
 print("\n===== Распределение FLAG =====")
-display(df_eda["FLAG"].value_counts(
-    normalize=True).rename("%").mul(100).round(2))
+display(df_eda["FLAG"].value_counts(normalize=True).rename("%").mul(100).round(2))
+
+# %%
+# import pandas as pd
+
+# # Группы по классу
+# df_flag_1 = df[df['FLAG'] == 1]
+# df_flag_0 = df[df['FLAG'] == 0]
+
+# # Определим минимальное количество между классами
+# min_class_count = min(len(df_flag_1), len(df_flag_0))
+
+# # Случайная выборка из каждого класса
+# df_flag_1_sampled = df_flag_1.sample(n=min_class_count, random_state=42)
+# df_flag_0_sampled = df_flag_0.sample(n=min_class_count*3, random_state=42)
+
+# # Объединяем и перемешиваем
+# df_balanced = pd.concat([df_flag_1_sampled, df_flag_0_sampled], ignore_index=True)
+# df_balanced = df_balanced.sample(frac=1, random_state=42).reset_index(drop=True)
+
+# # Проверим баланс классов
+# print(df_balanced['FLAG'].value_counts())
+
+# # Обновляем переменную df
+# df = df_balanced
+
 
 # %%
 # === @title Этап 4: очистка признаков перед обучением ===
 
+import pandas as pd, numpy as np
 
 # 0) Копируем исходный df
 df_clean = df.copy()
@@ -201,15 +237,6 @@ print("Удаляю строковые колонки:", str_cols)
 df_clean = df_clean.drop(columns=str_cols)
 
 # 3) Удаляем признаки с нулевой дисперсией
-zero_var = [
-    "ERC20 avg time between sent tnx",
-    "ERC20 avg time between rec tnx",
-    "ERC20 avg time between rec 2 tnx",
-    "ERC20 avg time between contract tnx",
-    "ERC20 min val sent contract",
-    "ERC20 max val sent contract",
-    "ERC20 avg val sent contract",
-]
 to_drop = [c for c in zero_var if c in df_clean.columns]
 print("Удаляю zero-variance:", to_drop)
 df_clean = df_clean.drop(columns=to_drop)
@@ -232,79 +259,57 @@ print("Осталось NaN всего:", df_clean.isna().sum().sum())
 
 # %%
 # === @title Этап 5: разделение и SMOTE ===
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import MinMaxScaler
 
-# 1) Готовим X и y
-SEED = 42
-X = df_clean.drop(columns=["FLAG"])
-y = df_clean["FLAG"]
-
-# 2) Разбиваем на train/test
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=SEED
+# 1) Разбиваем на train+val и test (80/20)
+X_temp, X_test, y_temp, y_test = train_test_split(
+    X, y,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
 )
 
-# 3) Распределение до SMOTE
-print(">> До SMOTE (train):")
-print(y_train.value_counts(), "\n")
+# 2) Делим оставшиеся на train и val (75/25 от X_temp → в итоге 60/20/20)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_temp, y_temp,
+    test_size=0.25,    # 0.25 * 0.8 = 0.2
+    stratify=y_temp,
+    random_state=42
+)
 
-# 4) Применяем SMOTE
-smote = SMOTE(random_state=SEED)
-X_train_res, y_train_res = smote.fit_resample(X_train, y_train)
+# 3) SMOTE только на train
+sm = SMOTE(random_state=42)
+X_train_res, y_train_res = sm.fit_resample(X_train, y_train)
 
-# 5) Распределение после SMOTE
-print(">> После SMOTE (train_resampled):")
-print(y_train_res.value_counts())
-
-# %%
-# === @title Этап 6 (исправленный): масштабирование признаков на всём датасете ===
-
-# 1) Подготовка: берём все числовые признаки (кроме метки FLAG)
-X_full = df_clean.drop(columns=["FLAG"]).values
-
-# 2) Инициализируем и подгоняем scaler на всём X_full
+# 4) Масштабирование только по train_res
 scaler = MinMaxScaler()
-scaler.fit(X_full)
+scaler.fit(X_train_res)
 
-# 3) Преобразуем тренировочные и тестовые данные
-X_train_scaled = scaler.transform(X_train_res)  # resampled train
-X_test_scaled = scaler.transform(X_test)       # original test
+X_train_s = scaler.transform(X_train_res)
+X_val_s   = scaler.transform(X_val)
+X_test_s  = scaler.transform(X_test)
 
-# 4) Проверка диапазонов
-print("== X_train_scaled ==")
-print("min:", np.min(X_train_scaled), " max:", np.max(X_train_scaled))
-print("shape:", X_train_scaled.shape)
+# 5) reshape для LSTM
+n_features    = X_train_s.shape[1]
+X_train_lstm  = X_train_s.reshape(-1, 1, n_features)
+X_val_lstm    = X_val_s.reshape(-1,   1, n_features)
+X_test_lstm   = X_test_s.reshape(-1,  1, n_features)
 
-print("\n== X_test_scaled ==")
-print("min:", np.min(X_test_scaled), " max:", np.max(X_test_scaled))
-print("shape:", X_test_scaled.shape)
+# 6) Правильно формируем y-объекты для валидации и теста
+y_val_lstm  = y_val.to_numpy()   # или y_val.values
+y_test_lstm = y_test.to_numpy()  # или y_test.values
 
-# %%
-# === @title Этап 7: подготовка данных для LSTM ===
-
-# 1) Форма для LSTM: (samples, timesteps=1, features)
-n_features = X_train_scaled.shape[1]
-
-X_train_lstm = X_train_scaled.reshape(-1, 1, n_features)
-X_test_lstm = X_test_scaled.reshape(-1, 1, n_features)
-
-# 2) Целевые массивы
-y_train_lstm = y_train_res.values if hasattr(
-    y_train_res, "values") else np.array(y_train_res)
-y_test_lstm = y_test.values if hasattr(y_test, "values") else np.array(y_test)
-
-# 3) Отладочная информация
-print("X_train_lstm shape:", X_train_lstm.shape)
-print("X_test_lstm  shape:", X_test_lstm.shape)
-print("y_train_lstm shape:", y_train_lstm.shape)
-print("y_test_lstm  shape:", y_test_lstm.shape)
 
 # %%
 # === @title Этап 8: построение LSTM-модели ===
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
 # 1) Создаём модель
 model = Sequential([
-    # timesteps=1, features=n_features
-    LSTM(64, input_shape=(1, X_train_lstm.shape[2])),
+    LSTM(64, input_shape=(1, X_train_lstm.shape[2])),  # timesteps=1, features=n_features
     Dense(1, activation='sigmoid')
 ])
 
@@ -320,27 +325,50 @@ model.summary()
 
 # %%
 # === @title Этап 9: обучение LSTM-модели ===
+import matplotlib.pyplot as plt
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 
-# Параметры обучения
-epochs = 200
-batch_size = 64
+# 1) Определяем колбэки
+es = EarlyStopping(
+    monitor='val_loss',
+    patience=10,
+    restore_best_weights=True,
+    verbose=1
+)
+rlrp = ReduceLROnPlateau(
+    monitor='val_loss',
+    factor=0.5,
+    patience=5,
+    min_lr=1e-6,
+    verbose=1
+)
+cp_callback = ModelCheckpoint(
+    filepath='checkpoints/lstm_best_weights.h5',
+    monitor='val_loss',
+    save_best_only=True,
+    mode='min',
+    verbose=1
+)
 
-# Запуск обучения
+epochs=200
+batch_size=32
+# 2) Fit с передачей callbacks
 history = model.fit(
-    X_train_lstm, y_train_lstm,
+    X_train_lstm, y_train_res,
     epochs=epochs,
     batch_size=batch_size,
-    validation_split=0.20,
-    shuffle=True,
+    validation_data=(X_val_lstm, y_val),
+    callbacks=[es, rlrp, cp_callback],
     verbose=2
 )
+
 
 # --- Отладочные графики ---
 
 # 1) Loss
-plt.figure(figsize=(8, 4))
+plt.figure(figsize=(8,4))
 plt.plot(history.history['loss'],    label='train_loss')
-plt.plot(history.history['val_loss'], label='val_loss')
+plt.plot(history.history['val_loss'],label='val_loss')
 plt.title('Training & Validation Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
@@ -348,9 +376,9 @@ plt.legend()
 plt.show()
 
 # 2) Accuracy
-plt.figure(figsize=(8, 4))
+plt.figure(figsize=(8,4))
 plt.plot(history.history['accuracy'],    label='train_acc')
-plt.plot(history.history['val_accuracy'], label='val_acc')
+plt.plot(history.history['val_accuracy'],label='val_acc')
 plt.title('Training & Validation Accuracy')
 plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
@@ -362,31 +390,36 @@ print(f"Final train_acc: {history.history['accuracy'][-1]:.4f}")
 print(f"Final val_acc:   {history.history['val_accuracy'][-1]:.4f}")
 
 # %%
-# === @title Этап 10: оценка модели на тесте ===
-
-# 1) Предсказания
 y_pred_proba = model.predict(X_test_lstm, verbose=0)
-y_pred = (y_pred_proba >= 0.5).astype(int).flatten()
+y_pred       = (y_pred_proba >= 0.5).astype(int).flatten()
 
-# 2) Метрики
-acc = accuracy_score(y_test_lstm, y_pred)
+# Проверим формы
+print("X_test_lstm.shape =", X_test_lstm.shape)
+print("y_test_lstm.shape =", y_test_lstm.shape)
+print("y_pred.shape       =", y_pred.shape)
+
+# Посчитаем метрики
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+
+acc  = accuracy_score(y_test_lstm, y_pred)
 prec = precision_score(y_test_lstm, y_pred)
-rec = recall_score(y_test_lstm, y_pred)
-f1 = f1_score(y_test_lstm, y_pred)
-cm = confusion_matrix(y_test_lstm, y_pred)
+rec  = recall_score(y_test_lstm, y_pred)
+f1   = f1_score(y_test_lstm, y_pred)
+cm   = confusion_matrix(y_test_lstm, y_pred)
 
-# 3) Вывод результатов
 print("=== Test Metrics ===")
 print(f"Accuracy : {acc:.4f}")
 print(f"Precision: {prec:.4f}")
 print(f"Recall   : {rec:.4f}")
 print(f"F1-score : {f1:.4f}\n")
-
 print("=== Confusion Matrix ===")
 print(cm)
 
 # %%
 # Шаг 1: Настройка callback для сохранения лучших весов
+from tensorflow.keras.callbacks import ModelCheckpoint
+import tensorflow as tf
+import os
 
 # Создаём папку для чекпойнтов, если её ещё нет
 os.makedirs("checkpoints", exist_ok=True)
@@ -416,6 +449,8 @@ history = model.fit(
 )
 
 # Шаг 3: Сохранение модели целиком и веса
+import pickle
+from pathlib import Path
 
 # 1) Создаём папку для артефактов
 artifacts_dir = Path("artifacts")
@@ -440,10 +475,10 @@ with open(features_path, "wb") as f:
 print(f"Список признаков сохранён в {features_path}")
 
 # Шаг 4: Извлечение и сохранение эмбеддингов
+_ = model.predict(X_train_lstm[:1])
 
 # Создаём модель для получения эмбеддингов (например, из первого LSTM слоя)
-embedding_model = tf.keras.Model(
-    inputs=model.input, outputs=model.layers[0].output)
+embedding_model = tf.keras.Model(inputs=model.input, outputs=model.layers[0].output)
 
 # Извлекаем эмбеддинги для тренировочных и тестовых данных
 embeddings_train = embedding_model.predict(X_train_lstm)
@@ -456,8 +491,7 @@ print(f"Эмбеддинги сохранены в 'artifacts/embeddings_train.n
 
 # Шаг 5: Проверка воспроизводимости (если необходимо)
 # Загружаем модель и другие артефакты
-model = tf.keras.models.load_model(
-    str(artifacts_dir / "lstm_eth_fraud_model.h5"))
+model = tf.keras.models.load_model(str(artifacts_dir / "lstm_eth_fraud_model.h5"))
 with open(artifacts_dir / "scaler.pkl", "rb") as f:
     scaler = pickle.load(f)
 with open(artifacts_dir / "features_list.pkl", "rb") as f:
@@ -468,3 +502,6 @@ embeddings_train = np.load("artifacts/embeddings_train.npy")
 embeddings_test = np.load("artifacts/embeddings_test.npy")
 
 print("Эмбеддинги и модель успешно загружены для дальнейшего использования.")
+
+
+

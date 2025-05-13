@@ -189,12 +189,12 @@ sent AS (
     MIN(tok_val)                AS ERC20_Min_Val_Sent,
     MAX(tok_val)                AS ERC20_Max_Val_Sent,
     AVG(tok_val)                AS ERC20_Avg_Val_Sent,
-    MIN(IF(peer_is_contract,tok_val,NULL))
-                               AS ERC20_Min_Val_Sent_Contract,
-    MAX(IF(peer_is_contract,tok_val,NULL))
-                               AS ERC20_Max_Val_Sent_Contract,
+    MIN(IF(peer_is_contract,tok_val,NULL))  AS ERC20_Min_Val_Sent_Contract,
+    MAX(IF(peer_is_contract,tok_val,NULL))  AS ERC20_Max_Val_Sent_Contract,
+    SUM(IF(peer_is_contract,tok_val,0))     AS ERC20_Total_Ether_Sent_Contract,
     AVG(IF(peer_is_contract,tok_val,NULL))
                                AS ERC20_Avg_Val_Sent_Contract,
+
     SUM(tok_val)                AS ERC20_Total_Ether_Sent
   FROM b WHERE is_sender GROUP BY address
 ),
@@ -262,7 +262,7 @@ SELECT
                                                        AS Total_ERC20_Tnxs,
   COALESCE(ERC20_Total_Ether_Received,0.0)              AS ERC20_Total_Ether_Received,
   COALESCE(ERC20_Total_Ether_Sent,0.0)                  AS ERC20_Total_Ether_Sent,
-  COALESCE(ERC20_Avg_Val_Sent_Contract,0.0)             AS ERC20_Total_Ether_Sent_Contract,
+  COALESCE(ERC20_Total_Ether_Sent_Contract,0.0)  AS ERC20_Total_Ether_Sent_Contract,
   COALESCE(ERC20_Uniq_Sent_Addr,CAST(0 AS INT64))       AS ERC20_Uniq_Sent_Addr,
   COALESCE(ERC20_Uniq_Rec_Addr,CAST(0 AS INT64))        AS ERC20_Uniq_Rec_Addr,
   COALESCE(ERC20_Uniq_Rec_Contract_Addr,CAST(0 AS INT64))
@@ -278,7 +278,6 @@ SELECT
   COALESCE(ERC20_Avg_Val_Sent,0.0)                      AS ERC20_Avg_Val_Sent,
   COALESCE(ERC20_Min_Val_Sent_Contract,0.0)             AS ERC20_Min_Val_Sent_Contract,
   COALESCE(ERC20_Max_Val_Sent_Contract,0.0)             AS ERC20_Max_Val_Sent_Contract,
-  COALESCE(ERC20_Avg_Val_Sent_Contract,0.0)             AS ERC20_Avg_Val_Sent_Contract,
   COALESCE(ERC20_Uniq_Sent_Token_Name,CAST(0 AS INT64)) AS ERC20_Uniq_Sent_Token_Name,
   COALESCE(ERC20_Uniq_Rec_Token_Name,CAST(0 AS INT64))  AS ERC20_Uniq_Rec_Token_Name,
   ERC20_Most_Sent_Token_Type,
@@ -291,15 +290,17 @@ LEFT JOIN uniq_tok_sent   USING(address)
 LEFT JOIN uniq_tok_recv   USING(address)
 LEFT JOIN timing          USING(address);
 
-/* 6. финальная таблица */
+/* 6. финальная таблица  ─ ДОБАВЛЯЕМ is_contract */
 CREATE OR REPLACE TABLE `celtic-tendril-459507-q8.fraud_lstm.address_features` AS
 SELECT
   ad.address,
-  ad.flag_text AS FLAG,
-  ad.flag_num  AS FLAG_NUM,
+  ad.flag_text   AS FLAG,
+  ad.flag_num    AS FLAG_NUM,
+  ad.is_contract AS is_contract,      -- ← добавили колонку
+  ad.scam_type   AS scam_type,           -- ← новое поле
   eth.* EXCEPT(address),
   erc.* EXCEPT(address)
-FROM `celtic-tendril-459507-q8.fraud_lstm.addresses`       ad
+FROM `celtic-tendril-459507-q8.fraud_lstm.addresses`        ad
 LEFT JOIN `celtic-tendril-459507-q8.fraud_lstm.eth_features`  eth USING(address)
 LEFT JOIN `celtic-tendril-459507-q8.fraud_lstm.erc20_features` erc USING(address);
 
