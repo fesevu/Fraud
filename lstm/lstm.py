@@ -8,7 +8,7 @@
 %pip install -U threadpoolctl joblib
 #%pip install --force-reinstall numpy==1.26.4
 %pip install --upgrade scikit-learn
-%pip install -U imbalanced-learn
+%pip install -U imbalanced-learn umap-learn
 
 %pip install --upgrade --force-reinstall \
     numpy \
@@ -206,7 +206,7 @@ display(df_eda["FLAG"].value_counts(normalize=True).rename("%").mul(100).round(2
 
 # # Случайная выборка из каждого класса
 # df_flag_1_sampled = df_flag_1.sample(n=min_class_count, random_state=42)
-# df_flag_0_sampled = df_flag_0.sample(n=min_class_count*3, random_state=42)
+# df_flag_0_sampled = df_flag_0.sample(n=int(min_class_count), random_state=42)
 
 # # Объединяем и перемешиваем
 # df_balanced = pd.concat([df_flag_1_sampled, df_flag_0_sampled], ignore_index=True)
@@ -259,9 +259,16 @@ print("Осталось NaN всего:", df_clean.isna().sum().sum())
 
 # %%
 # === @title Этап 5: разделение и SMOTE ===
+import numpy as np
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
 from sklearn.preprocessing import MinMaxScaler
+
+
+# 1) Готовим X и y
+SEED = 42
+X = df_clean.drop(columns=["FLAG"])
+y = df_clean["FLAG"]
 
 # 1) Разбиваем на train+val и test (80/20)
 X_temp, X_test, y_temp, y_test = train_test_split(
@@ -281,7 +288,7 @@ X_train, X_val, y_train, y_val = train_test_split(
 
 # 3) SMOTE только на train
 sm = SMOTE(random_state=42)
-X_train_res, y_train_res = sm.fit_resample(X_train, y_train)
+X_train_res, y_train_res = X_train, y_train
 
 # 4) Масштабирование только по train_res
 scaler = MinMaxScaler()
@@ -300,6 +307,87 @@ X_test_lstm   = X_test_s.reshape(-1,  1, n_features)
 # 6) Правильно формируем y-объекты для валидации и теста
 y_val_lstm  = y_val.to_numpy()   # или y_val.values
 y_test_lstm = y_test.to_numpy()  # или y_test.values
+
+
+# %%
+# import pandas as pd
+# from imblearn.over_sampling import SMOTE
+# from sklearn.decomposition import PCA
+# import umap
+# import matplotlib.pyplot as plt
+
+# # 1. Получаем X_train_res, y_train_res
+# sm = SMOTE(random_state=42)
+# X_res, y_res = sm.fit_resample(X_train, y_train)
+
+# # 2. Помечаем, какие точки синтетические
+# is_synth = ['real'] * len(X_train) + ['synthetic'] * (len(X_res) - len(X_train))
+# df_vis = pd.DataFrame(X_res)
+# df_vis['label'] = y_res
+# df_vis['type']  = is_synth
+# import numpy as np
+
+# X_raw = df_vis.drop(columns=['label','type'])
+# cols_inf = [c for c in X_raw.columns if np.isinf(X_raw[c]).any()]
+# print("Есть inf в столбцах:", cols_inf)
+# X_clean = X_raw.replace([np.inf, -np.inf], np.nan)
+# X_clean = X_clean.fillna(X_clean.median())
+
+# from sklearn.preprocessing import MinMaxScaler
+
+# scaler = MinMaxScaler()
+# X_scaled = scaler.fit_transform(X_clean)
+
+
+# # 3. UMAP в 2D
+# reducer = umap.UMAP(n_components=2, random_state=42)
+# emb = reducer.fit_transform(X_scaled)
+
+# # 4. Рисуем
+# plt.figure(figsize=(8,6))
+# for t, m in [('real','o'), ('synthetic','x')]:
+#     idx = df_vis['type']==t
+#     plt.scatter(emb[idx,0], emb[idx,1],
+#                 c=df_vis.loc[idx,'label'], marker=m,
+#                 alpha=0.6, label=t)
+# plt.legend()
+# plt.title("UMAP: реальные vs синтетические точки")
+# plt.show()
+
+
+# %%
+# from sklearn.neighbors import NearestNeighbors
+# import numpy as np
+
+# # X_res — массив всех точек после SMOTE, y_res — их метки
+# # mask_synth — булев массив, где True для синтетических
+# X_array = X_res  # shape (n_res, n_features)
+# y_array = y_res  # shape (n_res,)
+# mask_synth = np.array(is_synth) == 'synthetic'
+
+# # Найдём k ближайших соседей по Евклиду
+# k = 10
+# nn = NearestNeighbors(n_neighbors=k+1).fit(X_array)
+# distances, indices = nn.kneighbors(X_array)
+
+# bad = []  # здесь будем собирать %
+# for i in np.where(mask_synth)[0]:
+#     neigh_idx = indices[i][1:]  # без себя самого
+#     # сколько среди соседей — другого класса?
+#     frac_other = np.mean(y_array[neigh_idx] != y_array[i])
+#     bad.append(frac_other)
+
+# # Посмотрим распределение
+# import matplotlib.pyplot as plt
+# plt.hist(bad, bins=20)
+# plt.xlabel("Доля соседей другого класса")
+# plt.ylabel("Число синтетических точек")
+# plt.title("Насколько «грязная» синтетика?")
+# plt.show()
+
+# # Сколько точек с frac_other > 0.5
+# print("Сомнительных точек (>50% чужих соседей):",
+#       np.sum(np.array(bad)>0.5), "из", len(bad))
 
 
 # %%
@@ -352,12 +440,16 @@ cp_callback = ModelCheckpoint(
 
 epochs=200
 batch_size=32
-# 2) Fit с передачей callbacks
+# рассчитываем вес редкого класса
+w0 = 1.0
+w1 = len(y_train[y_train==0]) / len(y_train[y_train==1])
+
 history = model.fit(
     X_train_lstm, y_train_res,
     epochs=epochs,
     batch_size=batch_size,
     validation_data=(X_val_lstm, y_val),
+    class_weight={0: w0, 1: w1},
     callbacks=[es, rlrp, cp_callback],
     verbose=2
 )
@@ -438,13 +530,17 @@ cp_callback = ModelCheckpoint(
 )
 
 # Шаг 2: Обучение модели с использованием этого колбэка
+# рассчитываем вес редкого класса
+w0 = 1.0
+w1 = len(y_train[y_train==0]) / len(y_train[y_train==1])
+
 history = model.fit(
-    X_train_lstm, y_train_lstm,
+    X_train_lstm, y_train_res,
     epochs=epochs,
     batch_size=batch_size,
-    validation_split=0.20,
-    shuffle=True,
-    callbacks=[cp_callback],  # Добавляем колбэк
+    validation_data=(X_val_lstm, y_val),
+    class_weight={0: w0, 1: w1},
+    callbacks=[cp_callback],
     verbose=2
 )
 
