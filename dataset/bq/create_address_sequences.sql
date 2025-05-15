@@ -32,20 +32,22 @@ WITH
   ),
 
   all_activity AS (
-    -- ETH in+out
+    -- ETH in
     SELECT LOWER(from_address) AS address, DATE(block_timestamp) AS dt
     FROM `bigquery-public-data.crypto_ethereum.transactions`
     WHERE LOWER(from_address) IN (SELECT address FROM address_labels)
     UNION ALL
+    -- ETH out
     SELECT LOWER(to_address), DATE(block_timestamp)
     FROM `bigquery-public-data.crypto_ethereum.transactions`
     WHERE LOWER(to_address) IN (SELECT address FROM address_labels)
-    -- ERC20 in+out
     UNION ALL
+    -- ERC20 in
     SELECT LOWER(from_address), DATE(block_timestamp)
     FROM `bigquery-public-data.crypto_ethereum.token_transfers`
     WHERE LOWER(from_address) IN (SELECT address FROM address_labels)
     UNION ALL
+    -- ERC20 out
     SELECT LOWER(to_address), DATE(block_timestamp)
     FROM `bigquery-public-data.crypto_ethereum.token_transfers`
     WHERE LOWER(to_address) IN (SELECT address FROM address_labels)
@@ -74,7 +76,7 @@ WITH
     FROM windows, UNNEST(arr) AS d
   ),
 
-  -- ETH raw + tag
+  -- ETH raw и теги
   eth_raw AS (
     SELECT
       LOWER(from_address)               AS addr,
@@ -95,7 +97,7 @@ WITH
       ON e.peer = c.contract_addr
   ),
 
-  -- Разворачиваем LAG() в отдельное CTE
+  -- рассчитываем GAP между транзакциями
   eth_lag AS (
     SELECT
       e.*,
@@ -107,40 +109,40 @@ WITH
     FROM eth_tag e
   ),
 
-  -- Собственно агрегация ETH по вашим окнам
+  -- агрегация ETH по оконной схеме
   eth_win AS (
     SELECT
       w.address,
       w.window_start,
-      COUNTIF(is_sender)                      AS Sent_tnx,
-      COUNTIF(NOT is_sender)                  AS Received_tnx,
-      COUNTIF(created_contract AND is_sender) AS Number_of_Created_Contracts,
-      COUNT(DISTINCT IF(is_sender, peer, NULL))     AS Unique_Sent_To_Addresses,
-      COUNT(DISTINCT IF(NOT is_sender, peer, NULL)) AS Unique_Received_From_Addresses,
-      MIN(IF(NOT is_sender, val, NULL))       AS Min_Value_Received,
-      MAX(IF(NOT is_sender, val, NULL))       AS Max_Value_Received,
-      AVG(IF(NOT is_sender, val, NULL))       AS Avg_Value_Received,
-      MIN(IF(is_sender, val, NULL))           AS Min_Val_Sent,
-      MAX(IF(is_sender, val, NULL))           AS Max_Val_Sent,
-      AVG(IF(is_sender, val, NULL))           AS Avg_Val_Sent,
+      COUNTIF(is_sender)                               AS Sent_tnx,
+      COUNTIF(NOT is_sender)                           AS Received_tnx,
+      COUNTIF(created_contract AND is_sender)          AS Number_of_Created_Contracts,
+      COUNT(DISTINCT IF(is_sender, peer, NULL))        AS Unique_Sent_To_Addresses,
+      COUNT(DISTINCT IF(NOT is_sender, peer, NULL))    AS Unique_Received_From_Addresses,
+      MIN(IF(NOT is_sender, val, NULL))                AS Min_Value_Received,
+      MAX(IF(NOT is_sender, val, NULL))                AS Max_Value_Received,
+      AVG(IF(NOT is_sender, val, NULL))                AS Avg_Value_Received,
+      MIN(IF(is_sender, val, NULL))                    AS Min_Val_Sent,
+      MAX(IF(is_sender, val, NULL))                    AS Max_Val_Sent,
+      AVG(IF(is_sender, val, NULL))                    AS Avg_Val_Sent,
       MIN(IF(is_sender AND peer_is_contract, val, NULL)) AS Min_Value_Sent_To_Contract,
       MAX(IF(is_sender AND peer_is_contract, val, NULL)) AS Max_Value_Sent_To_Contract,
       AVG(IF(is_sender AND peer_is_contract, val, NULL)) AS Avg_Value_Sent_To_Contract,
-      SUM(IF(is_sender AND peer_is_contract, val, 0))    AS Total_Ether_Sent_Contracts,
-      SUM(IF(is_sender, val, 0))              AS Total_Ether_Sent,
-      SUM(IF(NOT is_sender, val, 0))          AS Total_Ether_Received,
-      COUNT(*)                                AS Total_Transactions_Including_Tnx_to_Create_Contract,
-      TIMESTAMP_DIFF(MAX(ts), MIN(ts), MINUTE) AS Time_Diff_between_first_and_last_Mins,
-      AVG(IF(is_sender, gap, NULL))           AS Avg_min_between_sent_tnx,
-      AVG(IF(NOT is_sender, gap, NULL))       AS Avg_min_between_received_tnx
+      SUM(IF(is_sender AND peer_is_contract, val, 0))   AS Total_Ether_Sent_Contracts,
+      SUM(IF(is_sender, val, 0))                       AS Total_Ether_Sent,
+      SUM(IF(NOT is_sender, val, 0))                   AS Total_Ether_Received,
+      COUNT(*)                                         AS Total_Transactions_Including_Tnx_to_Create_Contract,
+      TIMESTAMP_DIFF(MAX(ts), MIN(ts), MINUTE)         AS Time_Diff_between_first_and_last_Mins,
+      AVG(IF(is_sender, gap, NULL))                    AS Avg_min_between_sent_tnx,
+      AVG(IF(NOT is_sender, gap, NULL))                AS Avg_min_between_received_tnx
     FROM eth_lag e
     JOIN win w
-      ON e.addr       = w.address
+      ON e.addr = w.address
      AND DATE(e.ts) BETWEEN w.window_start AND w.window_end
     GROUP BY w.address, w.window_start
   ),
 
-  -- ERC-20: без изменений в логике gap
+  -- ERC-20 raw и теги
   tok AS (
     SELECT LOWER(address) AS token_addr,
            COALESCE(SAFE_CAST(decimals AS INT64), 0) AS decs
@@ -169,15 +171,15 @@ WITH
     SELECT
       w.address,
       w.window_start,
-      COUNTIF(sender = w.address)           AS ERC20_Total_Ether_Sent_Tnx,
-      COUNTIF(receiver = w.address)         AS ERC20_Total_Ether_Recv_Tnx,
-      SUM(IF(sender = w.address, val, 0))   AS ERC20_Total_Ether_Sent,
-      SUM(IF(receiver = w.address, val, 0)) AS ERC20_Total_Ether_Received,
+      COUNTIF(sender = w.address)               AS ERC20_Total_Ether_Sent_Tnx,
+      COUNTIF(receiver = w.address)             AS ERC20_Total_Ether_Recv_Tnx,
+      SUM(IF(sender = w.address, val, 0))       AS ERC20_Total_Ether_Sent,
+      SUM(IF(receiver = w.address, val, 0))     AS ERC20_Total_Ether_Received,
       SUM(IF(sender = w.address AND peer_is_contract, val, 0)) AS ERC20_Total_Ether_Sent_Contract,
       COUNT(DISTINCT IF(sender = w.address, receiver, NULL))  AS ERC20_Uniq_Sent_Addr,
       COUNT(DISTINCT IF(receiver = w.address, sender, NULL))  AS ERC20_Uniq_Rec_Addr,
       COUNT(DISTINCT IF(receiver = w.address AND peer_is_contract, sender, NULL))
-                                             AS ERC20_Uniq_Rec_Contract_Addr,
+                                               AS ERC20_Uniq_Rec_Contract_Addr,
       MIN(IF(receiver = w.address, val, NULL)) AS ERC20_Min_Val_Rec,
       MAX(IF(receiver = w.address, val, NULL)) AS ERC20_Max_Val_Rec,
       AVG(IF(receiver = w.address, val, NULL)) AS ERC20_Avg_Val_Rec,
@@ -186,22 +188,54 @@ WITH
       AVG(IF(sender = w.address, val, NULL))   AS ERC20_Avg_Val_Sent
     FROM erc_tag e
     JOIN win w
-      ON (e.sender   = w.address OR e.receiver = w.address)
+      ON (e.sender = w.address OR e.receiver = w.address)
      AND DATE(e.ts) BETWEEN w.window_start AND w.window_end
     GROUP BY w.address, w.window_start
   ),
 
-  -- Объединяем ETH + ERC20
+  -- Объединение ETH + ERC20
   full_win AS (
     SELECT
       w.address,
       w.window_start,
-      COALESCE(e.Sent_tnx, 0)                AS Sent_tnx,
-      COALESCE(e.Received_tnx, 0)            AS Received_tnx,
-      /* … остальные поля по аналогии … */
-      COALESCE(r.ERC20_Total_Ether_Sent_Tnx, 0)   AS ERC20_Total_Ether_Sent_Tnx,
-      COALESCE(r.ERC20_Total_Ether_Recv_Tnx, 0)   AS ERC20_Total_Ether_Recv_Tnx,
-      /* … и т.д. … */
+
+      -- ETH метрики
+      COALESCE(e.Sent_tnx, 0)                              AS Sent_tnx,
+      COALESCE(e.Received_tnx, 0)                          AS Received_tnx,
+      COALESCE(e.Number_of_Created_Contracts, 0)           AS Number_of_Created_Contracts,
+      COALESCE(e.Unique_Sent_To_Addresses, 0)              AS Unique_Sent_To_Addresses,
+      COALESCE(e.Unique_Received_From_Addresses, 0)        AS Unique_Received_From_Addresses,
+      e.Min_Value_Received                                 AS Min_Value_Received,
+      e.Max_Value_Received                                 AS Max_Value_Received,
+      e.Avg_Value_Received                                 AS Avg_Value_Received,
+      e.Min_Val_Sent                                       AS Min_Val_Sent,
+      e.Max_Val_Sent                                       AS Max_Val_Sent,
+      e.Avg_Val_Sent                                       AS Avg_Val_Sent,
+      e.Min_Value_Sent_To_Contract                         AS Min_Value_Sent_To_Contract,
+      e.Max_Value_Sent_To_Contract                         AS Max_Value_Sent_To_Contract,
+      e.Avg_Value_Sent_To_Contract                         AS Avg_Value_Sent_To_Contract,
+      e.Total_Ether_Sent_Contracts                         AS Total_Ether_Sent_Contracts,
+      e.Total_Ether_Sent                                   AS Total_Ether_Sent,
+      e.Total_Ether_Received                               AS Total_Ether_Received,
+      e.Time_Diff_between_first_and_last_Mins              AS Time_Diff_between_first_and_last_Mins,
+      e.Avg_min_between_sent_tnx                           AS Avg_min_between_sent_tnx,
+      e.Avg_min_between_received_tnx                       AS Avg_min_between_received_tnx,
+
+      -- ERC-20 метрики
+      COALESCE(r.ERC20_Total_Ether_Sent_Tnx, 0)             AS ERC20_Total_Ether_Sent_Tnx,
+      COALESCE(r.ERC20_Total_Ether_Recv_Tnx, 0)             AS ERC20_Total_Ether_Recv_Tnx,
+      COALESCE(r.ERC20_Total_Ether_Sent, 0)                 AS ERC20_Total_Ether_Sent,
+      COALESCE(r.ERC20_Total_Ether_Received, 0)             AS ERC20_Total_Ether_Received,
+      COALESCE(r.ERC20_Total_Ether_Sent_Contract, 0)        AS ERC20_Total_Ether_Sent_Contract,
+      COALESCE(r.ERC20_Uniq_Sent_Addr, 0)                   AS ERC20_Uniq_Sent_Addr,
+      COALESCE(r.ERC20_Uniq_Rec_Addr, 0)                    AS ERC20_Uniq_Rec_Addr,
+      COALESCE(r.ERC20_Uniq_Rec_Contract_Addr, 0)           AS ERC20_Uniq_Rec_Contract_Addr,
+      r.ERC20_Min_Val_Rec                                   AS ERC20_Min_Val_Rec,
+      r.ERC20_Max_Val_Rec                                   AS ERC20_Max_Val_Rec,
+      r.ERC20_Avg_Val_Rec                                   AS ERC20_Avg_Val_Rec,
+      r.ERC20_Min_Val_Sent                                  AS ERC20_Min_Val_Sent,
+      r.ERC20_Max_Val_Sent                                  AS ERC20_Max_Val_Sent,
+      r.ERC20_Avg_Val_Sent                                  AS ERC20_Avg_Val_Sent
     FROM win w
     LEFT JOIN eth_win e
       ON w.address = e.address AND w.window_start = e.window_start
@@ -209,7 +243,7 @@ WITH
       ON w.address = r.address AND w.window_start = r.window_start
   ),
 
-  -- Нумерация окон и усечение до max_steps
+  -- 8. Нумерация окон и усечение до max_steps
   sequenced AS (
     SELECT
       fw.*,
@@ -226,10 +260,42 @@ SELECT
   a.flag_num    AS FLAG_NUM,
   a.is_contract,
   a.scam_type,
-  (40 - 1) - seq.idx_desc  AS step_idx,
+  (40 - 1) - seq.idx_desc                AS step_idx,
   seq.window_start,
-  seq.Sent_tnx, seq.Received_tnx,
-  /* … остальные поля … */
+  seq.Sent_tnx,
+  seq.Received_tnx,
+  seq.Number_of_Created_Contracts,
+  seq.Unique_Sent_To_Addresses,
+  seq.Unique_Received_From_Addresses,
+  seq.Min_Value_Received,
+  seq.Max_Value_Received,
+  seq.Avg_Value_Received,
+  seq.Min_Val_Sent,
+  seq.Max_Val_Sent,
+  seq.Avg_Val_Sent,
+  seq.Min_Value_Sent_To_Contract,
+  seq.Max_Value_Sent_To_Contract,
+  seq.Avg_Value_Sent_To_Contract,
+  seq.Total_Ether_Sent_Contracts,
+  seq.Total_Ether_Sent,
+  seq.Total_Ether_Received,
+  seq.Time_Diff_between_first_and_last_Mins,
+  seq.Avg_min_between_sent_tnx,
+  seq.Avg_min_between_received_tnx,
+  seq.ERC20_Total_Ether_Sent_Tnx,
+  seq.ERC20_Total_Ether_Recv_Tnx,
+  seq.ERC20_Total_Ether_Sent,
+  seq.ERC20_Total_Ether_Received,
+  seq.ERC20_Total_Ether_Sent_Contract,
+  seq.ERC20_Uniq_Sent_Addr,
+  seq.ERC20_Uniq_Rec_Addr,
+  seq.ERC20_Uniq_Rec_Contract_Addr,
+  seq.ERC20_Min_Val_Rec,
+  seq.ERC20_Max_Val_Rec,
+  seq.ERC20_Avg_Val_Rec,
+  seq.ERC20_Min_Val_Sent,
+  seq.ERC20_Max_Val_Sent,
+  seq.ERC20_Avg_Val_Sent
 FROM sequenced seq
 JOIN `celtic-tendril-459507-q8.fraud_lstm.addresses` a
   ON seq.address = a.address
